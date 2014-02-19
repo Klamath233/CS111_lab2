@@ -299,6 +299,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				kfree(d->dead_tickets);
 				d->dead_tickets = temp_dead_tickets;
 			}
+			while (is_ticket_tail_dead(d)) {
+				d->ticket_tail++;
+			}
 			osp_spin_unlock(&d->mutex);
 			return -ERESTARTSYS;
 		}
@@ -312,6 +315,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		}
 		filp->f_flags |= F_OSPRD_LOCKED;
 		do {
+			printk("INCREMENTING TICKET TAIL ...\n");
 			d->ticket_tail++;
 		} while (is_ticket_tail_dead(d));
 		osp_spin_unlock(&d->mutex);
