@@ -17,6 +17,9 @@
 #include "spinlock.h"
 #include "osprd.h"
 
+// Code by Xi Han starts:
+#define ARRAY_INIT_SIZE 2
+// Code by Xi Han ends.
 /* The size of an OSPRD sector. */
 #define SECTOR_SIZE	512
 
@@ -68,7 +71,9 @@ typedef struct osprd_info {
 	// Code by Xi Han starts:
 	int read_lock;
 	int write_lock;
-	// TODO: Initialize the variables here.
+	unsigned *dead_tickets;
+	size_t dead_tickets_length;
+	size_t dead_tickets_capacity;
 	// Code by Xi Han ends.
 
 	// The following elements are used internally; you don't need
@@ -84,6 +89,13 @@ static osprd_info_t osprds[NOSPRD];
 
 
 // Declare useful helper functions
+
+// Code by Xi Han starts:
+// If current ticket tail of d is dead, return 1.
+// Otherwise, return 0.
+// d is guaranteed not to be modified.
+static int is_ticket_tail_dead(osprd_info_t *d);
+// Code by Xi Han ends.
 
 /*
  * file2osprd(filp)
@@ -138,6 +150,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	osp_spin_lock(&d->mutex);
 	printk("ACQUIRE LOCK\n");
 	direction = (int)rq_data_dir(req);
+
 	// 0 stands for a read from the device.
 	// Nonzero stands for a write to the device.
 	req_offset = (uint8_t *)req->buffer;
@@ -161,7 +174,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	osp_spin_unlock(&d->mutex);
 	printk("RELEASE LOCK");
 	// Code by Xi Han ends.
-	eprintk("Should process request...\n");
+	// eprintk("Should process request...\n");
 
 	end_request(req, 1);
 }
@@ -192,6 +205,7 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		// as appropriate.
 
 		// Your code here.
+		
 		// Code by Xi Han starts:
 		printk("In osprd_close_last: \n");
 		osp_spin_lock(&d->mutex);
@@ -208,6 +222,7 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		osp_spin_unlock(&d->mutex);
 		printk("RELEASE MUTEX\n");
 		// Code by Xi Han ends.
+
 		// This line avoids compiler warnings; you may remove it.
 		(void) filp_writable, (void) d;
 
@@ -270,7 +285,20 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		printk("wait returns: %d\n", wei_retval);
 		if (wei_retval == -ERESTARTSYS) {
 			osp_spin_lock(&d->mutex);
-			d->ticket_tail++;
+			printk("PROCESSING SIGNAL ... ADDING TICKET TO DEAD LIST\n");
+			
+			// If the process is killed. The ticket it holds expires.
+			// We mark this by adding it to an array.
+			d->dead_tickets[d->dead_tickets_length++] = local_ticket;
+			if (d->dead_tickets_length == d->dead_tickets_capacity) {
+				d->dead_tickets_capacity *= 2;
+				unsigned *temp_dead_tickets = kzalloc(sizeof(unsigned) *
+				d->dead_tickets_capacity, GFP_ATOMIC);
+				memcpy(temp_dead_tickets, d->dead_tickets, sizeof(unsigned) *
+				d->dead_tickets_length);
+				kfree(d->dead_tickets);
+				d->dead_tickets = temp_dead_tickets;
+			}
 			osp_spin_unlock(&d->mutex);
 			return -ERESTARTSYS;
 		}
@@ -283,7 +311,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			d->read_lock++;
 		}
 		filp->f_flags |= F_OSPRD_LOCKED;
-		d->ticket_tail++;
+		do {
+			d->ticket_tail++;
+		} while (is_ticket_tail_dead(d));
 		osp_spin_unlock(&d->mutex);
 		printk("RELEASE MUTEX\n");
 		// Code by Xi Han ends.
@@ -394,12 +424,27 @@ static void osprd_setup(osprd_info_t *d)
 	d->ticket_head = d->ticket_tail = 0;
 	/* Add code here if you add fields to osprd_info_t. */
 	// Code by Xi Han starts:
+	// Initialization of additonal fields.
 	d->read_lock = 0;
 	d->write_lock = 0;
+	d->dead_tickets = kzalloc(sizeof(unsigned) * ARRAY_INIT_SIZE, GFP_ATOMIC);
+	d->dead_tickets_length = 0;
+	d->dead_tickets_capacity = ARRAY_INIT_SIZE;
 	// Code by Xi Han ends.
 }
 
-
+// Code by Xi Han starts:
+// Simple linear search.
+static int is_ticket_tail_dead(osprd_info_t *d) {
+	size_t i;
+	for (i = 0; i < d->dead_tickets_length; i++) {
+		if (d->ticket_tail == d->dead_tickets[i]) {
+			return 1;
+		}
+	}
+	return 0;
+}
+// Code by Xi Han ends.
 /*****************************************************************************/
 /*         THERE IS NO NEED TO UNDERSTAND ANY CODE BELOW THIS LINE!          */
 /*                                                                           */
