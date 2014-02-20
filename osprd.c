@@ -314,13 +314,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			d->wqueue_head->task = current;
 		}
 		osp_spin_unlock(&d->mutex);
-		printk("%d\n", d->write_lock == 0 && (!filp_writable || d->read_lock ==
-		0) && d->ticket_tail == local_ticket);
 		wei_retval = wait_event_interruptible(d->blockq,
 							d->write_lock == 0 &&
 							(!filp_writable || d->read_lock == 0) &&
 							d->ticket_tail == local_ticket);
-		printk("wait returns: %d\n", wei_retval);
 		if (wei_retval == -ERESTARTSYS) {
 			osp_spin_lock(&d->mutex);
 			
