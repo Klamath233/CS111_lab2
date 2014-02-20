@@ -75,6 +75,11 @@ typedef struct osprd_info {
 	size_t dead_tickets_length;
 	size_t dead_tickets_capacity;
 	// Code by Xi Han ends.
+	
+	// Code by SG starts
+	int deadlock_write;
+	int deadlock_write;
+	// Code by SG ends
 
 	// The following elements are used internally; you don't need
 	// to understand them.
@@ -117,6 +122,58 @@ static void for_each_open_file(struct task_struct *task,
 						osprd_info_t *user_data),
 			       osprd_info_t *user_data);
 
+// Code by SG starts
+
+// Declare helper funciton that will check locks
+// This function will be passed into for_each_file_open to check each file
+void check_locks(struct file * filp, osprd_info_t *d)
+{
+	// Check to see if current process already is already in request queue
+	// Or if its already holding the wrong lock on the device, then return deadlock.
+	
+	// Only check device we are requesting lock for
+	if(file2osprd(filp) == d)
+	{
+		// If we have lock on device, check to see if its allowed
+		if(filp->f_flags & F_OSPRD_LOCKED)
+		{	
+			// Limitation: Does not check blocked requests?
+			// Will cause deadlock on write
+			if(filp->f_mode & FMODE_WRITE )
+				d->deadlock_read = 1;
+			// and/or will cause deadlock on read
+			d->deadlock_write = 1;
+		}
+	}
+}
+
+
+//if the device is already in use, and we are about to block to wait for it, make sure processes
+//owning the locks dont include us!
+bool deadlock (osprd_info_t *d, int filp_writable)
+{
+	osp_spin_lock(&d->mutex);
+	
+	// Reset deadlock flagging variables
+	d->deadlock_write = 0;
+	d->deadlock_read = 0;
+	
+	// Check locks on each of the current process' open files
+	for_each_open_file(current,check_locks,d);
+	
+	//if filp_writable is true, we are requesting a write block
+	if( d->deadlock_read || (d->deadlock_write && filp_writable) )
+	{
+		osp_spin_unlock(&d->mutex);
+		return true;
+	}
+	
+	// No deadlocks, return false
+	osp_spin_unlock(&d->mutex);  
+	return false;
+}
+
+// Code by SG ends
 
 /*
  * osprd_process_request(d, req)
@@ -263,6 +320,16 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// the ramdisk.
 		//
 		
+		// Code by SG starts
+		// Check deadlocks before processing requests
+		if(deadlock(d,filp_writable))
+		{
+			// Do not process R/W request if deadlock
+			eprintk("Avoiding deadlock\n");
+			return -EDEADLK;
+		}
+		// Code by SG ends
+		
 		// Code by Xi Han starts:
 		printk("In OSPRDIOCACQUIRE:\n");
 		unsigned local_ticket;
@@ -308,9 +375,34 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
 		osp_spin_lock(&d->mutex);
 		printk("ACQUIRE MUTEX\n");
-		if (filp_writable) {
+		if (filp_writable) 
+		{
+			// Code by SG starts
+			// Check deadlocks before processing request
+			if(deadlock(d,filp_writable))
+			{
+				// Do not process R/W request if deadlock
+				eprintk("Avoiding deadlock\n");
+				return -EDEADLK;
+			}
+			d->deadlock_write = 0;
+			// Code by SG ends
+			
 			d->write_lock++;
-		} else {
+		} 
+		else 
+		{
+			// Code by SG starts
+			// Check deadlocks before processing requests
+			if(deadlock(d,filp_writable))
+			{
+				// Do not process R/W request if deadlock
+				eprintk("Avoiding deadlock\n");
+				return -EDEADLK;
+			}
+			d->deadlock_read = 0;
+			// Code by SG ends
+			
 			d->read_lock++;
 		}
 		filp->f_flags |= F_OSPRD_LOCKED;
