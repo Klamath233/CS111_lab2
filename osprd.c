@@ -78,7 +78,7 @@ typedef struct osprd_info {
 	
 	// Code by SG starts
 	int deadlock_write;
-	int deadlock_write;
+	int deadlock_read;
 	// Code by SG ends
 
 	// The following elements are used internally; you don't need
@@ -322,10 +322,12 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		
 		// Code by SG starts
 		// Check deadlocks before processing requests
+		osp_spin_lock(&d->mutex);
 		if(deadlock(d,filp_writable))
 		{
 			// Do not process R/W request if deadlock
 			eprintk("Avoiding deadlock\n");
+			osp_spin_unlock(&d->mutex);
 			return -EDEADLK;
 		}
 		// Code by SG ends
@@ -377,21 +379,25 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		printk("ACQUIRE MUTEX\n");
 		if (filp_writable) 
 		{
+			/*
 			// Code by SG starts
 			// Check deadlocks before processing request
 			if(deadlock(d,filp_writable))
 			{
 				// Do not process R/W request if deadlock
 				eprintk("Avoiding deadlock\n");
+				osp_spin_unlock(&d->mutex);
 				return -EDEADLK;
 			}
 			d->deadlock_write = 0;
 			// Code by SG ends
+			*/
 			
 			d->write_lock++;
 		} 
 		else 
 		{
+			/*
 			// Code by SG starts
 			// Check deadlocks before processing requests
 			if(deadlock(d,filp_writable))
@@ -402,6 +408,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			}
 			d->deadlock_read = 0;
 			// Code by SG ends
+			*/
 			
 			d->read_lock++;
 		}
@@ -414,7 +421,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		printk("RELEASE MUTEX\n");
 		// Code by Xi Han ends.
 
-        // This lock request must block using 'd->blockq' until:
+		// This lock request must block using 'd->blockq' until:
 		// 1) no other process holds a write lock;
 		// 2) either the request is for a read lock, or no other process
 		//    holds a read lock; and
