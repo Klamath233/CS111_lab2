@@ -47,6 +47,11 @@ MODULE_AUTHOR("Shubham Gandhi & Xi Han");
 static int nsectors = 32;
 module_param(nsectors, int, 0);
 
+typedef struct waiter_node {
+	struct task_struct *task;
+	int writable;
+	struct waiter_node *next;
+} waiter_node_t;
 
 /* The internal representation of our device. */
 typedef struct osprd_info {
@@ -74,8 +79,9 @@ typedef struct osprd_info {
 	unsigned *dead_tickets;
 	size_t dead_tickets_length;
 	size_t dead_tickets_capacity;
+	waiter_node_t *wqueue_head;
 	// Code by Xi Han ends.
-
+	
 	// The following elements are used internally; you don't need
 	// to understand them.
 	struct request_queue *queue;    // The device request queue.
@@ -83,6 +89,7 @@ typedef struct osprd_info {
 	                                //   exclusion in the 'queue'.
 	struct gendisk *gd;             // The generic disk.
 } osprd_info_t;
+
 
 #define NOSPRD 4
 static osprd_info_t osprds[NOSPRD];
@@ -146,9 +153,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	// Your code here.
 
 	// Code by Xi Han starts:
-	printk("TRYING TO ACQUIRE LOCK ...\n");
 	osp_spin_lock(&d->mutex);
-	printk("ACQUIRE LOCK\n");
 	direction = (int)rq_data_dir(req);
 
 	// 0 stands for a read from the device.
@@ -172,7 +177,6 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 		memcpy(req_offset, dev_offset, buffer_size);
 	}
 	osp_spin_unlock(&d->mutex);
-	printk("RELEASE LOCK");
 	// Code by Xi Han ends.
 	// eprintk("Should process request...\n");
 
@@ -207,20 +211,33 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		// Your code here.
 		
 		// Code by Xi Han starts:
-		printk("In osprd_close_last: \n");
 		osp_spin_lock(&d->mutex);
-		printk("ACQUIRE MUTEX\n");
 		if (filp->f_flags & F_OSPRD_LOCKED) {
 			if (filp_writable) {
 				d->write_lock--;
 			} else {
 				d->read_lock--;
 			}
+			waiter_node_t *temp = NULL;
+			waiter_node_t *temp_prev = NULL;
+			if (d->wqueue_head) {
+				for (temp = d->wqueue_head; temp->next != NULL;) {
+					temp_prev = temp;
+					temp = temp->next;
+				}
+	
+				if (temp_prev) {
+					temp_prev->next = NULL;
+					kfree(temp);
+				} else {
+					d->wqueue_head = NULL;
+					kfree(temp);
+				}
+			}
 			wake_up_all(&d->blockq);
 			filp->f_flags &= !F_OSPRD_LOCKED;
 		}
 		osp_spin_unlock(&d->mutex);
-		printk("RELEASE MUTEX\n");
 		// Code by Xi Han ends.
 
 		// This line avoids compiler warnings; you may remove it.
@@ -251,7 +268,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
 	// This line avoids compiler warnings; you may remove it.
 	(void) filp_writable, (void) d;
-	printk("In osprd_ioctl\n");
 	// Set 'r' to the ioctl's return value: 0 on success, negative on error
 
 	if (cmd == OSPRDIOCACQUIRE) {
@@ -264,18 +280,40 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		//
 		
 		// Code by Xi Han starts:
-		printk("In OSPRDIOCACQUIRE:\n");
 		unsigned local_ticket;
 		int wei_retval;
 		osp_spin_lock(&d->mutex);
-		printk("ACQUIRE MUTEX\n");
+		waiter_node_t *iterator  = d->wqueue_head;
+		if (iterator) {
+			for (;iterator->next != NULL; iterator = iterator->next) {							if (iterator->task == current) {
+					if (filp_writable || iterator->writable) {
+						osp_spin_unlock(&d->mutex);
+						return -EDEADLK;
+					}
+				}
+			}
+			if (iterator->task == current) {
+				if (filp_writable || iterator->writable) {
+					osp_spin_unlock(&d->mutex);
+					return -EDEADLK;
+				}
+			}
+			
+		}
 		local_ticket = d->ticket_head++;
-		printk("head: %u local: %u tail: %u\n", d->ticket_head, local_ticket,
-		d->ticket_tail);
+		if (d->wqueue_head) {
+			waiter_node_t *temp = kzalloc(sizeof(waiter_node_t), GFP_ATOMIC);
+			temp->writable = filp_writable;
+			temp->next = d->wqueue_head->next;
+			temp->task = current;
+			d->wqueue_head->next = temp;
+		} else {
+			d->wqueue_head = kzalloc(sizeof(waiter_node_t), GFP_ATOMIC);
+			d->wqueue_head->next = NULL;
+			d->wqueue_head->writable = filp_writable;
+			d->wqueue_head->task = current;
+		}
 		osp_spin_unlock(&d->mutex);
-		printk("RELEASE MUTEX\n");
-		printk("write locks: %d\n", d->write_lock);
-		printk("read locks: %d\n", d->read_lock);
 		printk("%d\n", d->write_lock == 0 && (!filp_writable || d->read_lock ==
 		0) && d->ticket_tail == local_ticket);
 		wei_retval = wait_event_interruptible(d->blockq,
@@ -285,7 +323,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		printk("wait returns: %d\n", wei_retval);
 		if (wei_retval == -ERESTARTSYS) {
 			osp_spin_lock(&d->mutex);
-			printk("PROCESSING SIGNAL ... ADDING TICKET TO DEAD LIST\n");
 			
 			// If the process is killed. The ticket it holds expires.
 			// We mark this by adding it to an array.
@@ -302,27 +339,83 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			while (is_ticket_tail_dead(d)) {
 				d->ticket_tail++;
 			}
+
+			waiter_node_t *temp = NULL;
+			waiter_node_t *temp_prev = NULL;
+
+			for (temp = d->wqueue_head; temp->next != NULL;) {
+				if (temp->task == current) {
+					if (temp_prev) {
+						temp_prev->next = temp->next;
+						kfree(temp);
+						temp = temp_prev->next;
+					} else {
+						d->wqueue_head = temp->next;
+						kfree(temp);
+						temp = d->wqueue_head;
+					}
+				} else {
+					temp_prev = temp;
+					temp = temp->next;
+				}
+			}
+
+			if (d->wqueue_head && d->wqueue_head->task == current) {
+				kfree(d->wqueue_head);
+				d->wqueue_head = NULL;
+			}
+
 			osp_spin_unlock(&d->mutex);
 			return -ERESTARTSYS;
 		}
 
 		osp_spin_lock(&d->mutex);
-		printk("ACQUIRE MUTEX\n");
-		if (filp_writable) {
+		if (filp_writable) 
+		{
+			/*
+			// Code by SG starts
+			// Check deadlocks before processing request
+			if(deadlock(d,filp_writable))
+			{
+				// Do not process R/W request if deadlock
+				eprintk("Avoiding deadlock\n");
+				osp_spin_unlock(&d->mutex);
+				return -EDEADLK;
+			}
+			d->deadlock_write = 0;
+			// Code by SG ends
+			*/
+			
 			d->write_lock++;
-		} else {
+		} 
+		else 
+		{
+			/*
+			// Code by SG starts
+			// Check deadlocks before processing requests
+			if(deadlock(d,filp_writable))
+			{
+				// Do not process R/W request if deadlock
+				eprintk("Avoiding deadlock\n");
+				return -EDEADLK;
+			}
+			d->deadlock_read = 0;
+			// Code by SG ends
+			*/
+			
 			d->read_lock++;
 		}
 		filp->f_flags |= F_OSPRD_LOCKED;
 		do {
-			printk("INCREMENTING TICKET TAIL ...\n");
 			d->ticket_tail++;
+
 		} while (is_ticket_tail_dead(d));
+
 		osp_spin_unlock(&d->mutex);
-		printk("RELEASE MUTEX\n");
+
 		// Code by Xi Han ends.
 
-        // This lock request must block using 'd->blockq' until:
+		// This lock request must block using 'd->blockq' until:
 		// 1) no other process holds a write lock;
 		// 2) either the request is for a read lock, or no other process
 		//    holds a read lock; and
@@ -365,9 +458,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Your code here (instead of the next two lines).
 
 		// Code by Xi Han starts:
-		printk("In OSPRDIOCTRYACQUIRE:\n");
 		osp_spin_lock(&d->mutex);
-		printk("ACQUIRE MUTEX\n");
 		if (d->write_lock == 0 &&
 			(!filp_writable || d->read_lock == 0) &&
 			d->ticket_tail == d->ticket_head) {
@@ -383,7 +474,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			r = -EBUSY;
 		}
 		osp_spin_unlock(&d->mutex);
-		printk("RELEASE MUTEX\n");
 		// Code by Xi Han ends.
 
 	} else if (cmd == OSPRDIOCRELEASE) {
@@ -396,9 +486,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// you need, and return 0.
 
 		// Your code here (instead of the next line).
-		printk("In OSPRDIOCRELEASE:\n");
 		osp_spin_lock(&d->mutex);
-		printk("ACQUIRE MUTEX\n");
 		if (!filp->f_flags & F_OSPRD_LOCKED) {
 			r = -EINVAL;
 		} else {
@@ -407,11 +495,24 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			} else {
 				d->read_lock--;
 			}
+			waiter_node_t *temp = NULL;
+			waiter_node_t *temp_prev = NULL;
+			for (temp = d->wqueue_head; temp->next != NULL;) {
+				temp_prev = temp;
+				temp = temp->next;
+			}
+
+			if (temp_prev) {
+				temp_prev->next = NULL;
+				kfree(temp);
+			} else {
+				d->wqueue_head = NULL;
+				kfree(temp);
+			}
 			wake_up_all(&d->blockq);
 			filp->f_flags &= !F_OSPRD_LOCKED;
 		}
 		osp_spin_unlock(&d->mutex);
-		printk("RELEASE MUTEX\n");
 	} else
 		r = -ENOTTY; /* unknown command */
 	return r;
@@ -434,6 +535,7 @@ static void osprd_setup(osprd_info_t *d)
 	d->dead_tickets = kzalloc(sizeof(unsigned) * ARRAY_INIT_SIZE, GFP_ATOMIC);
 	d->dead_tickets_length = 0;
 	d->dead_tickets_capacity = ARRAY_INIT_SIZE;
+	d->wqueue_head = NULL;
 	// Code by Xi Han ends.
 }
 
